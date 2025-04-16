@@ -1,0 +1,317 @@
+---
+title: "hyperparameter-tuning"
+format: 
+  html:
+    self-contained: true
+editor: visual
+author: "Claire Mittel"
+---
+
+# Data import/tidy/transform
+
+```{r}
+library(tidyverse)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(tidymodels)
+library(ggplot2)
+library(ggthemes)
+library(ranger)
+library(xgboost)
+library(dplyr)
+library(skimr)
+library(visdat)
+library(rsample)
+library(parsnip)
+library(workflowsets)
+library(workflows)
+library(tune)
+library(patchwork)
+```
+
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+```
+
+```{r}
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+```
+
+```{r}
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+```
+
+```{r}
+# Where the files live online ...
+remote_files  <- glue('{root}/camels_{types}.txt')
+# where we want to download the data ...
+local_files   <- glue('data/camels_{types}.txt')
+```
+
+```{r}
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+```
+
+```{r}
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+```
+
+```{r}
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+```{r}
+glimpse(camels)
+skim(camels)
+```
+
+```{r}
+vis_dat(camels)
+vis_miss(camels)
+```
+
+```{r}
+clean_data <- camels %>%
+  janitor::clean_names() %>% 
+  drop_na() %>%              
+  filter(!is.na(gauge_lat) & !is.na(gauge_lon)) 
+```
+
+```{r}
+ggplot(data = clean_data, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+```
+
+# Data splitting
+
+```{r}
+set.seed(123)
+```
+
+```{r}
+data_split <- initial_split(clean_data, prop = 0.80)  
+train_data <- training(data_split)
+test_data <- testing(data_split)
+```
+
+# Feature engineering
+
+```{r}
+q_recipe <- recipe(q_mean ~ ., data = train_data) %>%
+  step_rm(gauge_lat, gauge_lon) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+prepped_recipe <- prep(q_recipe)
+baked_train <- bake(prepped_recipe, new_data = NULL)
+```
+
+# Resampling and model testing
+
+```{r}
+set.seed(123)  
+folds <- vfold_cv(train_data, v = 10)
+folds
+```
+
+```{r}
+linear_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+```
+
+```{r}
+rf_spec <- rand_forest(mtry = 3, trees = 500, min_n = 5) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+```
+
+```{r}
+boost_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = 6,
+  learn_rate = 0.01,
+  loss_reduction = 0.01
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+```{r}
+model_list <- list(
+  linear_reg = linear_spec,
+  random_forest = rf_spec,
+  boosted_tree = boost_spec)
+
+workflow_set <- workflow_set(
+  preproc = list(q_recipe), 
+  models = model_list)
+```
+
+```{r}
+workflow_results <- workflow_map(
+  workflow_set,
+  resamples = folds,
+  metrics = metric_set(rmse, rsq),  # can include mae if you want
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r}
+autoplot(workflow_results)
+```
+
+```{r}
+collect_metrics(workflow_results)
+```
+
+I think that the boost tree model shows the best results for this data. I think this because it has the lowest RMSE and highest R sq value. The boost tree model uses the xgboost engine and is a regression model. I think that this model is working best because it tests nonlinear relationships.
+
+# Model tuning
+
+```{r}
+tuned_boost_spec <- boost_tree(
+  trees = 1000, 
+  tree_depth = tune(),      
+  learn_rate = tune(),      
+  loss_reduction = tune()   
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+```{r}
+tuned_boost_workflow <- workflow() %>%
+  add_model(tuned_boost_spec) %>%
+  add_recipe(q_recipe)
+```
+
+```{r}
+dials <- extract_parameter_set_dials(tuned_boost_workflow)
+dials$object
+```
+
+```{r}
+my.grid <- grid_space_filling(
+  x = dials,
+  size = 25
+)
+```
+
+```{r}
+my.grid
+```
+
+```{r}
+model_params <- tune_grid(
+  tuned_boost_workflow,      
+  resamples = folds,          
+  grid = my.grid,             
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+autoplot(model_params)
+
+```
+
+What I see is that the results for each of the models is pretty scattered but the most scattered is the middle one.
+
+```{r}
+collect_metrics(model_params) %>%
+  arrange(mean)
+```
+
+```{r}
+show_best(model_params, metric = "mae", n = 5)
+```
+
+I see that the best hyperparameter is tree depth from this table.
+
+```{r}
+hp_best <- select_best(model_params, metric = "mae")
+```
+
+```{r}
+final_wf <- finalize_workflow(
+  tuned_boost_workflow, 
+  hp_best)
+```
+
+# Final model verification
+
+```{r}
+final_fit <- last_fit(
+  final_wf,
+  split = data_split
+)
+```
+
+```{r}
+collect_metrics(final_fit)
+```
+
+```{r}
+final_preds <- collect_predictions(final_fit)
+```
+
+```{r}
+ggplot(final_preds, aes(x = .pred, y = q_mean)) +
+  geom_point(aes(color = q_mean), alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  geom_abline(slope = 1, intercept = 0, color = "navy", linetype = "solid") +
+  scale_color_viridis_c(option = "plasma") +
+  labs(
+    title = "Predicted vs. Actual q_mean on Test Set",
+    x = "Predicted q_mean",
+    y = "Actual q_mean",
+    color = "True q_mean"
+  ) +
+  theme_minimal()
+```
+
+# Building a map
+
+```{r}
+final_model <- fit(final_wf, data = clean_data)
+```
+
+```{r}
+pred_data <- augment(final_model, new_data = clean_data)
+```
+
+```{r}
+pred_data <- pred_data %>%
+  mutate(residual_sq = (q_mean - .pred)^2)
+```
+
+```{r}
+map_preds <- ggplot(data = pred_data, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = .pred)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+  labs(title = "Predicted q_mean Across CONUS", color = "Predicted q_mean")
+```
+
+```{r}
+map_resid <- ggplot(data = pred_data, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = residual_sq)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+  labs(title = "Squared Residuals Across CONUS", color = "Residuals²")
+```
+
+```{r}
+map_preds + map_resid + plot_layout(ncol = 2)
+```

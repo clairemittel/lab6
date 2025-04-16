@@ -306,12 +306,12 @@ rank_results(wf, rank_metric = "rsq", select_best = TRUE)
 ```
 
 # #3
+
 ```{r}
 xgb_model <- boost_tree() %>%
   set_engine("xgboost") %>%
   set_mode("regression")
 ```
-
 
 ```{r}
 nn_model <- bag_mlp() %>%
@@ -454,6 +454,7 @@ rf_wf2 <- workflow() %>%
 rf_wf2 <- augment(rf_wf2, new_data = camels_test2)
 dim(rf_wf2)
 ```
+
 ```{r}
 ggplot(rf_wf2, aes(x = logQmean, y = .pred, colour = aridity)) +
   scale_color_viridis_c() +
@@ -462,4 +463,4 @@ ggplot(rf_wf2, aes(x = logQmean, y = .pred, colour = aridity)) +
   theme_linedraw()
 ```
 
-I think that these results correlate with what we see in the comparisons and that they are close to the predictions. 
+I think that these results correlate with what we see in the comparisons and that they are close to the predictions.
